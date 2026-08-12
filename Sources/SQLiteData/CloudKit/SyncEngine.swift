@@ -1601,30 +1601,26 @@
                 .execute(db)
             }
           }
-          // Replay parked records from the in-memory cache first — their
-          // content was already delivered by the zone fetch that parked them
-          // (FK violation: child before parent), so no server round trip is
-          // needed. Only cache misses (a relaunch lost the in-memory cache)
-          // fall back to the server fetch. Before the cache, this re-fetch
-          // ran after EVERY batch over the whole growing backlog — quadratic
-          // server traffic that paced a ~6k-record initial sync to over an
-          // hour and drew requestRateLimited.
+          // Parked records (FK violation: child before parent) replay from
+          // the in-memory cache via the post-apply fixpoint below — their
+          // content was already delivered, so no server round trip. The
+          // server fetch here recovers ONLY cache misses: a relaunch
+          // mid-sync lost the in-memory records, leaving their persisted
+          // `UnsyncedRecordID` rows without content. Before the cache, this
+          // re-fetch ran after EVERY batch over the whole growing backlog —
+          // quadratic server traffic that paced a ~6k-record initial sync to
+          // over an hour and drew requestRateLimited.
           var unsyncedRecords: [CKRecord] = []
           let parked = parkedServerRecords.withValue { $0 }
           var missingRecordIDs: [CKRecord.ID] = []
-          for recordID in unsyncedRecordIDs {
-            if let record = parked[recordID] {
-              unsyncedRecords.append(record)
-            } else {
-              missingRecordIDs.append(recordID)
-            }
+          for recordID in unsyncedRecordIDs where parked[recordID] == nil {
+            missingRecordIDs.append(recordID)
           }
-          if !unsyncedRecordIDs.isEmpty {
+          if !missingRecordIDs.isEmpty {
             logger.log(
               """
-              sqlitedata-diag: unsynced-record resolution \
-              \(unsyncedRecords.count) replayed locally, \
-              \(missingRecordIDs.count) fetched from server
+              sqlitedata-diag: recovering \(missingRecordIDs.count) relaunch-lost \
+              parked records from server
               """
             )
           }
@@ -1694,15 +1690,47 @@
             var shares: [ShareOrReference] = []
             var fetchedShareRecordIDs: Set<CKRecord.ID> = []
             var referencesByRecordID: [CKRecord.ID: CKShare.Reference] = [:]
+            var appliedCount = 0
             for record in modifications {
               if let share = record as? CKShare {
                 shares.append(.share(share))
                 fetchedShareRecordIDs.insert(share.recordID)
               } else {
-                upsertFromServerRecord(record, db: db)
+                if upsertFromServerRecord(record, db: db) {
+                  appliedCount += 1
+                }
                 if let shareReference = record.share {
                   referencesByRecordID[shareReference.recordID] = shareReference
                 }
+              }
+            }
+            // Replay parked records ONLY when this batch applied something —
+            // an applied record is the only event that can unblock a parked
+            // child, so a batch where everything parked (the common shape
+            // while the FK tree's root records haven't arrived yet) skips
+            // the replay entirely. When there IS progress, replay to
+            // fixpoint: each pass applies the children unblocked by the
+            // previous one. A blind full replay after every batch was
+            // quadratic local work (re-attempting thousands of failing
+            // upserts per batch) once the network refetch was fixed.
+            if appliedCount > 0 {
+              var parkedCount = parkedServerRecords.withValue(\.count)
+              while parkedCount > 0 {
+                let parkedRecords = parkedServerRecords
+                  .withValue { Array($0.values) }
+                  .sorted { lhs, rhs in
+                    topologicallyAscending(
+                      lhsTableName: lhs.recordType,
+                      rhsTableName: rhs.recordType,
+                      rootFirst: true
+                    )
+                  }
+                for record in parkedRecords {
+                  upsertFromServerRecord(record, db: db)
+                }
+                let remaining = parkedServerRecords.withValue(\.count)
+                guard remaining < parkedCount else { break }
+                parkedCount = remaining
               }
             }
             for (recordID, shareReference) in referencesByRecordID
@@ -1711,13 +1739,24 @@
             {
               shares.append(.reference(shareReference))
             }
+            let parkedNow = parkedServerRecords.withValue(\.count)
             logger.log(
               """
-              sqlitedata-diag: fetched-batch applied \(modifications.count) modifications, \
-              \(referencesByRecordID.count) share refs (\(cachedShareRecordIDs.count) cached) \
-              → \(shares.count) share fetches
+              sqlitedata-diag: batch applied \(appliedCount)/\(modifications.count), \
+              parked \(parkedNow), share fetches \(shares.count)
               """
             )
+            if appliedCount == 0, parkedNow > 0 {
+              // Composition of the stuck set, to make dependency-order
+              // pathologies visible in a plain log collect.
+              let byType = parkedServerRecords.withValue {
+                Dictionary(grouping: $0.keys) { $0.tableName ?? "?" }
+                  .map { "\($0.key)=\($0.value.count)" }
+                  .sorted()
+                  .joined(separator: " ")
+              }
+              logger.log("sqlitedata-diag: parked composition \(byType, privacy: .public)")
+            }
             return shares
           }
         }
@@ -2024,11 +2063,16 @@
       }
     }
 
+    /// Returns `false` when the record was parked by a foreign-key violation
+    /// (child before parent — retried by the replay fixpoint in
+    /// `handleFetchedRecordZoneChanges`); `true` for every other outcome.
+    @discardableResult
     private func upsertFromServerRecord(
       _ serverRecord: CKRecord,
       force: Bool = false,
       db: Database
-    ) {
+    ) -> Bool {
+      var parked = false
       withErrorReporting(.sqliteDataCloudKitFailure) {
         guard
           let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey,
@@ -2111,10 +2155,12 @@
             }
             .execute(db)
             parkedServerRecords.withValue { $0[serverRecord.recordID] = serverRecord }
+            parked = true
           }
         }
         try open(table)
       }
+      return !parked
     }
 
     private func refreshLastKnownServerRecord(_ record: CKRecord) async {
