@@ -1604,6 +1604,9 @@
               orderedUnsyncedRecordIDs
               .dropFirst(start)
               .prefix(batchSize)
+            logger.log(
+              "sqlitedata-diag: unsynced-record resolution fetching \(recordIDsBatch.count) records"
+            )
             let results = try await syncEngine.database.records(for: Array(recordIDsBatch))
             for (recordID, result) in results {
               switch result {
@@ -1674,6 +1677,13 @@
             {
               shares.append(.reference(shareReference))
             }
+            logger.log(
+              """
+              sqlitedata-diag: fetched-batch applied \(modifications.count) modifications, \
+              \(referencesByRecordID.count) share refs (\(cachedShareRecordIDs.count) cached) \
+              → \(shares.count) share fetches
+              """
+            )
             return shares
           }
         }
@@ -1688,6 +1698,9 @@
                 try await self.cacheShare(share)
               }
             case .reference(let shareReference):
+              self.logger.log(
+                "sqlitedata-diag: share-reference bootstrap fetch"
+              )
               guard
                 let record = try? await syncEngine.database.record(for: shareReference.recordID),
                 let share = record as? CKShare
@@ -2111,6 +2124,9 @@
         record[columnName] is CKAsset
       }
       if recordHasAsset {
+        logger.log(
+          "sqlitedata-diag: asset re-fetch for \(record.recordType, privacy: .public)"
+        )
         record = try await container.database(for: record.recordID).record(for: record.recordID)
       }
 
