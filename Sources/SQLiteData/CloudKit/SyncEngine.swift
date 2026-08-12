@@ -544,6 +544,16 @@
             currentRecordTypeByTableName: currentRecordTypeByTableName
           )
           try await cacheUserTables(recordTypes: currentRecordTypes)
+          // Reconcile rows whose pending upload was lost: metadata exists but
+          // no server record was ever stamped and no pending change survives
+          // (e.g. the process died before the not-running trigger path's
+          // fire-and-forget persistence Task ran, or before live engine state
+          // was serialized). Previously this ran only on account sign-IN, so
+          // such rows strand forever on normal launches. Touching them here
+          // re-fires the metadata triggers into the now-running engine; a
+          // no-op when nothing is stranded, and legitimately-pending rows
+          // coalesce by record ID.
+          try await enqueueUnknownRecordsForCloudKit()
         }
       }
       self.startTask.withValue {
@@ -629,8 +639,6 @@
     ) async throws {
       try await enqueueLocallyPendingChanges()
       try await userDatabase.write { db in
-        try PendingRecordZoneChange.delete().execute(db)
-
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
           previousRecordTypeByTableName[tableName] == nil
         }
@@ -644,12 +652,36 @@
     }
 
     private func enqueueLocallyPendingChanges() async throws {
-      let pendingRecordZoneChanges = try await metadatabase.read { db in
-        try PendingRecordZoneChange
-          .select(\.pendingRecordZoneChange)
-          .fetchAll(db)
-      }
-      let changesByIsPrivate = Dictionary(grouping: pendingRecordZoneChanges) {
+      // Read by rowid, enqueue into engine state, and only then delete the
+      // rows that were read — in that order. The previous shape (read, then a
+      // blanket 'PendingRecordZoneChange.delete()' in a later transaction)
+      // could wipe a change the not-running trigger path persisted between
+      // the two, losing it forever. With a scoped delete every interleaving
+      // is safe: a change inserted concurrently is not in the read set, so it
+      // survives for the next start; a crash after the enqueue but before the
+      // delete merely re-enqueues the same change next start (the engine
+      // coalesces by record ID).
+      let pendingRows: [(rowID: Int64, change: CKSyncEngine.PendingRecordZoneChange)] =
+        try await metadatabase.read { db in
+          try Row.fetchAll(
+            db,
+            sql: """
+              SELECT "rowid", "pendingRecordZoneChange"
+              FROM "\(String.sqliteDataCloudKitSchemaName)_pendingRecordZoneChanges"
+              """
+          )
+          .compactMap { row in
+            guard
+              let data = row["pendingRecordZoneChange"] as Data?,
+              let representation = CKSyncEngine.PendingRecordZoneChange.DataRepresentation(
+                queryBinding: .blob([UInt8](data))
+              )
+            else { return nil }
+            return (row["rowid"] as Int64, representation.queryOutput)
+          }
+        }
+      guard !pendingRows.isEmpty else { return }
+      let changesByIsPrivate = Dictionary(grouping: pendingRows.map(\.change)) {
         switch $0 {
         case .deleteRecord(let recordID), .saveRecord(let recordID):
           recordID.zoneID.ownerName == CKCurrentUserDefaultName
@@ -660,6 +692,16 @@
       syncEngines.withValue {
         $0.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
         $0.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+      }
+      let consumedRowIDs = pendingRows.map(\.rowID)
+      try await userDatabase.write { db in
+        try db.execute(
+          sql: """
+            DELETE FROM "\(String.sqliteDataCloudKitSchemaName)_pendingRecordZoneChanges"
+            WHERE "rowid" IN (\(databaseQuestionMarks(count: consumedRowIDs.count)))
+            """,
+          arguments: StatementArguments(consumedRowIDs)
+        )
       }
     }
 
@@ -1595,16 +1637,42 @@
       let shares: [ShareOrReference] =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await userDatabase.write { db in
+            // Every record in a shared hierarchy carries the same share
+            // reference, so a large initial fetch would otherwise fetch the
+            // same CKShare once per record ('CKFetchRecordsOperation' +
+            // 'shareMetadata', two server calls each) — enough to draw
+            // 'serviceUnavailable'/'requestRateLimited' from the container.
+            // Deduplicate references per batch, and skip shares that are
+            // already cached: a share the client has never seen needs the
+            // bootstrap fetch, but updates to a known share arrive as CKShare
+            // records in the change feed (the '.share' case) and refresh the
+            // cache without this fetch.
+            let cachedShareRecordIDs = Set(
+              try SyncMetadata
+                .where(\.isShared)
+                .select(\.share)
+                .fetchAll(db)
+                .compactMap { $0?.recordID }
+            )
             var shares: [ShareOrReference] = []
+            var fetchedShareRecordIDs: Set<CKRecord.ID> = []
+            var referencesByRecordID: [CKRecord.ID: CKShare.Reference] = [:]
             for record in modifications {
               if let share = record as? CKShare {
                 shares.append(.share(share))
+                fetchedShareRecordIDs.insert(share.recordID)
               } else {
                 upsertFromServerRecord(record, db: db)
                 if let shareReference = record.share {
-                  shares.append(.reference(shareReference))
+                  referencesByRecordID[shareReference.recordID] = shareReference
                 }
               }
+            }
+            for (recordID, shareReference) in referencesByRecordID
+            where !fetchedShareRecordIDs.contains(recordID)
+              && !cachedShareRecordIDs.contains(recordID)
+            {
+              shares.append(.reference(shareReference))
             }
             return shares
           }
