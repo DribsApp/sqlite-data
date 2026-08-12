@@ -43,6 +43,17 @@
     private let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
+    // Server records parked by a foreign-key violation during apply (child
+    // arrived before its parent — routine across fetch batches, since the
+    // server delivers records in arbitrary order). The per-batch retry
+    // replays from this cache instead of re-downloading the parked backlog
+    // from CloudKit — previously that re-fetch ran after EVERY batch over a
+    // growing set (quadratic server traffic; observed pacing a ~6k-record
+    // initial sync to over an hour and drawing requestRateLimited). The
+    // persisted `UnsyncedRecordID` table remains the crash-recovery net: a
+    // relaunch mid-sync falls back to the server fetch for whatever this
+    // in-memory cache lost.
+    private let parkedServerRecords = LockIsolated<[CKRecord.ID: CKRecord]>([:])
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
@@ -1590,23 +1601,46 @@
                 .execute(db)
             }
           }
+          // Replay parked records from the in-memory cache first — their
+          // content was already delivered by the zone fetch that parked them
+          // (FK violation: child before parent), so no server round trip is
+          // needed. Only cache misses (a relaunch lost the in-memory cache)
+          // fall back to the server fetch. Before the cache, this re-fetch
+          // ran after EVERY batch over the whole growing backlog — quadratic
+          // server traffic that paced a ~6k-record initial sync to over an
+          // hour and drew requestRateLimited.
+          var unsyncedRecords: [CKRecord] = []
+          let parked = parkedServerRecords.withValue { $0 }
+          var missingRecordIDs: [CKRecord.ID] = []
+          for recordID in unsyncedRecordIDs {
+            if let record = parked[recordID] {
+              unsyncedRecords.append(record)
+            } else {
+              missingRecordIDs.append(recordID)
+            }
+          }
+          if !unsyncedRecordIDs.isEmpty {
+            logger.log(
+              """
+              sqlitedata-diag: unsynced-record resolution \
+              \(unsyncedRecords.count) replayed locally, \
+              \(missingRecordIDs.count) fetched from server
+              """
+            )
+          }
           let batchSize = 150
-          let orderedUnsyncedRecordIDs = unsyncedRecordIDs.sorted {
+          let orderedMissingRecordIDs = missingRecordIDs.sorted {
             topologicallyAscending(
               lhsTableName: $0.tableName,
               rhsTableName: $1.tableName,
               rootFirst: true
             )
           }
-          var unsyncedRecords: [CKRecord] = []
-          for start in stride(from: 0, to: orderedUnsyncedRecordIDs.count, by: batchSize) {
+          for start in stride(from: 0, to: orderedMissingRecordIDs.count, by: batchSize) {
             let recordIDsBatch =
-              orderedUnsyncedRecordIDs
+              orderedMissingRecordIDs
               .dropFirst(start)
               .prefix(batchSize)
-            logger.log(
-              "sqlitedata-diag: unsynced-record resolution fetching \(recordIDsBatch.count) records"
-            )
             let results = try await syncEngine.database.records(for: Array(recordIDsBatch))
             for (recordID, result) in results {
               switch result {
@@ -2058,6 +2092,7 @@
               try #sql(upsert(table, record: serverRecord, columnNames: columnNames)).execute(db)
             }
             try UnsyncedRecordID.find(serverRecord.recordID).delete().execute(db)
+            parkedServerRecords.withValue { $0[serverRecord.recordID] = nil }
             try SyncMetadata
               .find(serverRecord.recordID)
               .update { $0.setLastKnownServerRecord(serverRecord) }
@@ -2075,6 +2110,7 @@
             } onConflictDoUpdate: { _ in
             }
             .execute(db)
+            parkedServerRecords.withValue { $0[serverRecord.recordID] = serverRecord }
           }
         }
         try open(table)
