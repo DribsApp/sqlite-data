@@ -168,8 +168,9 @@
         }
       }
 
+      let fetchedShare = try await existingShare
       let sharedRecord =
-        try await existingShare
+        fetchedShare
         ?? CKShare(
           rootRecord: lastKnownServerRecord,
           shareID: CKRecord.ID(
@@ -178,7 +179,24 @@
           )
         )
 
+      let snapshotBeforeConfigure = fetchedShare.map(ShareSnapshot.init)
       configure(sharedRecord)
+
+      // An existing share that `configure` left as it was is returned as fetched, not saved
+      // again. Since iOS/macOS 26, CloudKit refuses an in-process save of a share holding a
+      // one-time-link participant (added by the system sharing UI's Messages invite) without the
+      // `icloud-extended-share-access` entitlement, so an unconditional save here made such a
+      // share impossible to manage. `changedKeys()` can't tell: it flags same-value writes.
+      if let fetchedShare, snapshotBeforeConfigure == ShareSnapshot(fetchedShare) {
+        try await userDatabase.write { db in
+          try SyncMetadata
+            .where { $0.recordName.eq(recordName) }
+            .update { $0.share = #bind(fetchedShare) }
+            .execute(db)
+        }
+        return SharedRecord(container: container, share: fetchedShare)
+      }
+
       let (saveResults, _) = try await container.database(for: sharedRecord.recordID).modifyRecords(
         saving: [sharedRecord, lastKnownServerRecord],
         deleting: []
@@ -478,4 +496,23 @@
       }
     }
   #endif
+
+  /// What `SyncEngine.share(record:configure:)`'s `configure` can change on a share: its fields,
+  /// public permission and participants. Values compare with `isEqual`.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private struct ShareSnapshot: Equatable {
+    let values: NSDictionary
+    let publicPermission: CKShare.ParticipantPermission
+    let participantCount: Int
+
+    init(_ share: CKShare) {
+      var values: [String: Any] = [:]
+      for key in share.allKeys() {
+        values[key] = share[key]
+      }
+      self.values = values as NSDictionary
+      self.publicPermission = share.publicPermission
+      self.participantCount = share.participants.count
+    }
+  }
 #endif

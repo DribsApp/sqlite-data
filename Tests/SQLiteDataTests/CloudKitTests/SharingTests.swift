@@ -993,6 +993,37 @@
         }
       }
 
+      /// Re-sharing a record whose share already exists and that `configure` leaves unchanged
+      /// must not save the share again. Since iOS/macOS 26, CloudKit refuses an in-process save
+      /// of a share with a one-time-link participant (added by the system sharing UI's
+      /// Messages invite) unless the app holds the `icloud-extended-share-access`
+      /// entitlement, so an unconditional re-save made an invited share impossible to manage.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func shareTwiceUnchangedDoesNotSaveAgain() async throws {
+        let remindersList = RemindersList(id: 1, title: "Personal")
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            remindersList
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        let first = try await syncEngine.share(
+          record: remindersList,
+          configure: {
+            $0[CKShare.SystemFieldKey.title] = "Join my list!"
+          })
+        let second = try await syncEngine.share(
+          record: remindersList,
+          configure: {
+            $0[CKShare.SystemFieldKey.title] = "Join my list!"
+          })
+
+        #expect(second.share.recordID == first.share.recordID)
+        #expect(second.share._recordChangeTag == first.share._recordChangeTag)
+        #expect(second.share[CKShare.SystemFieldKey.title] as? String == "Join my list!")
+      }
+
       // NB: Swift 6.2 cannot currently compile this:
       //     Pattern that the region based isolation checker does not understand how to check.
       //     Please file a bug.
