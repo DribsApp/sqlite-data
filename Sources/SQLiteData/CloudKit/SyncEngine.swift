@@ -2021,7 +2021,13 @@
       }
     }
 
-    func deleteShare(shareRecordID: CKRecord.ID) async throws {
+    /// Clears a share that the owner stopped from the system sharing UI out of the record's sync
+    /// metadata, so the record stops reading as shared without waiting for a fetch.
+    /// `CloudSharingView`'s controller delegate calls this on iOS. Public for AppKit, where the
+    /// app runs `NSSharingService(named: .cloudSharing)` itself and gets the stop from
+    /// `NSCloudSharingServiceDelegate.sharingService(_:didStopSharing:)`: a `fetchChanges()`
+    /// there returns without a network request until CloudKit notifies the change.
+    public func deleteShare(shareRecordID: CKRecord.ID) async throws {
       let shareAndRecordNameAndZone = try await metadatabase.read { db in
         try SyncMetadata
           .where(\.isShared)
