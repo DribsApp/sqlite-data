@@ -361,6 +361,28 @@
         }
 
         @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func suspensionSpanningAWholeFetchNeverReachesTheCap() async throws {
+          // One fetch while suspended delivers more events than the cap. Each
+          // attempt overlaps the suspension, so none may count toward it.
+          defer { resume() }
+          let state = try serialization("after-fetch")
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          await handleWhileSuspended(.stateUpdate(stateSerialization: state))
+          await handleWhileSuspended(.willFetchChanges)
+          await handleWhileSuspended(.didFetchChanges)
+          await handleWhileSuspended(.willFetchChanges)
+          #expect(try await persistedPrivateState() == nil)
+
+          resume()
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
+          #expect(try await persistedPrivateState() == encoded(state))
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
         @Test func recurringErrorWithoutSuspensionIsGivenUpAfterTheCap() async throws {
           // Every insert fails the way a suspended writer's does, but nothing
           // is ever suspended: not a suspension, and it will not go away.

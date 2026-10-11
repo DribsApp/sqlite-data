@@ -59,12 +59,17 @@
     // `syncEngines` before `deferredState`, never the reverse, so that
     // `stop()`/`start()` swap the engines and drop what the old ones
     // deferred in one step.
-    // Starts out not suspended: the host must build the engine before it
-    // starts posting suspensions (Dribs builds it in `DatabaseLaunchRecovery`
-    // before `DatabaseSuspensionLifecycle.install()`). An engine built while
-    // the database is already suspended would not know until the next
-    // notification; the interruption errors its writes report still mark
-    // their events unapplied.
+    // Starts out not suspended, so the host MUST build the engine before it
+    // starts posting suspensions; this is required for correctness, not an
+    // optimization. An engine built while the database is already suspended
+    // never saw that suspension: until the next notification its counter
+    // reports none, so each failed attempt counts only toward
+    // `maxAttemptsWithoutSuspension`, and a single fetch (batch, then
+    // stateUpdate, then didFetch…) burns the cap, gives the batch up and
+    // lets the token move past it. GRDB exposes no public suspension state to
+    // read here, and posting a notification to learn it would suspend or
+    // resume every observing pool. Dribs satisfies this: it builds the engine
+    // in `DatabaseLaunchRecovery` before `DatabaseSuspensionLifecycle.install()`.
     private let suspension = LockIsolated(DatabaseSuspensionState())
     private let deferredState = LockIsolated(
       DeferredStatePersistence<DeferredEvent, CKSyncEngine.State.Serialization>()
@@ -1306,10 +1311,13 @@
         return true
       }
       deferUnapplied([deferred], scope: scope, syncEngine: syncEngine)
+      let reason =
+        sawSuspension ? "overlapped a suspension" : "suspension-shaped error, no suspension seen"
       logger.log(
         """
-        sqlitedata-diag: \(event.description, privacy: .public) overlapped a database \
-        suspension; deferred
+        sqlitedata-diag: \(event.description, privacy: .public) deferred \
+        (\(reason, privacy: .public)); attempts without suspension \
+        \(deferred.attemptsWithoutSuspension)/\(Self.maxAttemptsWithoutSuspension)
         """
       )
       return false
@@ -2653,8 +2661,8 @@
     }
   }
 
-  /// Notes whether any reported error was a GRDB interruption error. It
-  /// reports nothing itself.
+  /// Notes whether any reported error was suspension-shaped
+  /// (`DatabaseError.isSuspensionShaped`). It reports nothing itself.
   private final class InterruptionRecorder: IssueReporter, Sendable {
     private let _sawInterruption = LockIsolated(false)
     var sawInterruption: Bool { _sawInterruption.value }
