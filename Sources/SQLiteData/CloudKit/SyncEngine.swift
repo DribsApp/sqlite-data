@@ -55,6 +55,16 @@
     // relaunch mid-sync falls back to the server fetch for whatever this
     // in-memory cache lost.
     private let parkedServerRecords = LockIsolated<[CKRecord.ID: CKRecord]>([:])
+    // GRDB suspension tracking (see `DeferredStatePersistence`). Lock order:
+    // `syncEngines` before `deferredState`, never the reverse, so that
+    // `stop()`/`start()` swap the engines and drop what the old ones
+    // deferred in one step.
+    private let suspension = LockIsolated(DatabaseSuspensionState())
+    private let deferredState = LockIsolated(
+      DeferredStatePersistence<Event, CKSyncEngine.State.Serialization>()
+    )
+    private let suspensionObservers = LockIsolated<[any NSObjectProtocol]>([])
+    private let isRetryingAfterResume = LockIsolated(false)
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
 
     func withActivity<T: Sendable>(_ name: String, _ work: @Sendable () async -> T) async -> T {
@@ -323,6 +333,26 @@
           }
         }
       #endif
+      if userDatabase.configuration.observesSuspensionNotifications {
+        // GRDB's own notifications, on the center GRDB observes. An event
+        // whose writes overlapped a suspension is retried (see
+        // `DeferredStatePersistence`). The pools registered their observers
+        // when they opened, before this, so on a resume the pool is writable
+        // again before `isSuspended` clears.
+        let center = NotificationCenter.default
+        suspensionObservers.withValue {
+          $0 = [
+            center.addObserver(forName: Database.suspendNotification, object: nil, queue: nil) {
+              [suspension] _ in
+              suspension.withValue { $0.didSuspend() }
+            },
+            center.addObserver(forName: Database.resumeNotification, object: nil, queue: nil) {
+              [weak self] _ in
+              self?.databaseDidResume()
+            },
+          ]
+        }
+      }
       try validateSchema()
     }
 
@@ -331,6 +361,9 @@
         guard let observer = $0
         else { return }
         NotificationCenter.default.removeObserver(observer)
+      }
+      suspensionObservers.withValue {
+        $0.forEach(NotificationCenter.default.removeObserver)
       }
     }
 
@@ -461,6 +494,9 @@
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         syncEngines.withValue {
           $0 = SyncEngines()
+          // The next engine starts from the saved token and fetches anything
+          // queued here again; nothing deferred by this one may outlive it.
+          deferredState.withValue { $0.reset() }
         }
       }
     }
@@ -482,6 +518,7 @@
             private: privateSyncEngine,
             shared: sharedSyncEngine
           )
+          deferredState.withValue { $0.reset() }
         }
       }
 
@@ -1065,7 +1102,157 @@
 
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
       await withActivity("handleEvent.\(event.description)") {
-        await self.handleEventNow(event, syncEngine: syncEngine)
+        await self.handleEventDeferringInterruptedWork(event, syncEngine: syncEngine)
+      }
+    }
+
+    /// Only an engine whose user database obeys GRDB's suspension
+    /// notifications tracks them. Any other pool keeps writing through a
+    /// posted suspension, so there is nothing to retry.
+    private var tracksSuspension: Bool {
+      userDatabase.configuration.observesSuspensionNotifications
+    }
+
+    /// Runs `body` on the deferred state, but only while `syncEngine` is one of
+    /// the running engines: a delivery still in flight from an engine that
+    /// `stop()` discarded must not queue events for, or hold or release state
+    /// into, the engines that replaced it. Returns nil for such an engine.
+    private func withDeferredState<R: Sendable>(
+      of syncEngine: any SyncEngineProtocol,
+      _ body: @Sendable (inout DeferredStatePersistence<Event, CKSyncEngine.State.Serialization>)
+        -> R
+    ) -> R? {
+      syncEngines.withValue { engines in
+        guard
+          engines.isRunning,
+          engines.private === syncEngine || engines.shared === syncEngine
+        else { return nil }
+        return deferredState.withValue { body(&$0) }
+      }
+    }
+
+    private func handleEventDeferringInterruptedWork(
+      _ event: Event,
+      syncEngine: any SyncEngineProtocol
+    ) async {
+      guard tracksSuspension, withDeferredState(of: syncEngine, { _ in () }) != nil else {
+        await handleEventNow(event, syncEngine: syncEngine)
+        return
+      }
+      let scope = syncEngine.database.databaseScope
+      // CKSyncEngine delivers one scope's events serially, so retrying
+      // here, before the event itself, keeps the batches in order.
+      await retryUnappliedEvents(scope: scope, syncEngine: syncEngine)
+      switch event {
+      case .stateUpdate(let stateSerialization):
+        let held = withDeferredState(of: syncEngine) {
+          $0.holdIfBlocked(stateSerialization, scope: scope)
+        }
+        if held == true {
+          logger.log("sqlitedata-diag: holding back sync state behind unapplied changes")
+          return
+        }
+        // This state is newer than any held one, which must not be written
+        // over it afterwards.
+        _ = withDeferredState(of: syncEngine) { $0.takeHeldStateIfUnblocked(scope: scope) }
+        await handleEventNow(event, syncEngine: syncEngine)
+        return
+      case .fetchedDatabaseChanges, .fetchedRecordZoneChanges, .sentRecordZoneChanges:
+        if withDeferredState(of: syncEngine, { $0.isBlocked(scope: scope) }) == true {
+          // An older event of this scope is still unapplied (the retry above
+          // failed again). Applying this one first could reorder the
+          // batches, e.g. resurrect a record a later batch deletes.
+          deferUnapplied([event], scope: scope, syncEngine: syncEngine)
+        } else {
+          await applyDetectingSuspension(event, scope: scope, syncEngine: syncEngine)
+        }
+      default:
+        await handleEventNow(event, syncEngine: syncEngine)
+      }
+      if let held = withDeferredState(of: syncEngine, { $0.takeHeldStateIfUnblocked(scope: scope) })
+        ?? nil
+      {
+        await handleStateUpdate(stateSerialization: held, syncEngine: syncEngine)
+      }
+    }
+
+    private func retryUnappliedEvents(
+      scope: CKDatabase.Scope,
+      syncEngine: any SyncEngineProtocol
+    ) async {
+      let events = withDeferredState(of: syncEngine) { $0.takeUnapplied(scope: scope) } ?? []
+      guard !events.isEmpty else { return }
+      logger.log("sqlitedata-diag: retrying \(events.count) suspension-interrupted events")
+      for (index, event) in events.enumerated() {
+        let applied = await applyDetectingSuspension(event, scope: scope, syncEngine: syncEngine)
+        guard applied else {
+          // Keep the rest queued, in order, behind the one that failed again.
+          deferUnapplied(Array(events[(index + 1)...]), scope: scope, syncEngine: syncEngine)
+          return
+        }
+      }
+    }
+
+    private func deferUnapplied(
+      _ events: [Event],
+      scope: CKDatabase.Scope,
+      syncEngine: any SyncEngineProtocol
+    ) {
+      guard !events.isEmpty else { return }
+      _ = withDeferredState(of: syncEngine) { deferred in
+        for event in events {
+          deferred.recordUnapplied(event, scope: scope)
+        }
+      }
+    }
+
+    /// Every write in the handlers is wrapped in `withErrorReporting`, so a
+    /// failure from suspension is invisible from here. Whether a
+    /// suspension overlapped the event is not: retrying an event that did
+    /// apply is harmless (upserts are idempotent; the relaunch path
+    /// re-delivers batches the same way).
+    ///
+    /// Returns whether the event ran clear of any suspension.
+    @discardableResult
+    private func applyDetectingSuspension(
+      _ event: Event,
+      scope: CKDatabase.Scope,
+      syncEngine: any SyncEngineProtocol
+    ) async -> Bool {
+      let before = suspension.value
+      await handleEventNow(event, syncEngine: syncEngine)
+      guard suspension.value.overlapsSuspension(since: before) else { return true }
+      deferUnapplied([event], scope: scope, syncEngine: syncEngine)
+      logger.log(
+        """
+        sqlitedata-diag: \(event.description, privacy: .public) overlapped a database \
+        suspension; deferred
+        """
+      )
+      return false
+    }
+
+    private func databaseDidResume() {
+      suspension.withValue { $0.didResume() }
+      guard deferredState.withValue(\.hasAnythingDeferred) else { return }
+      // One retry at a time. The retry's own activity can resume the database
+      // (the host's hold does, from the background), which lands here again;
+      // starting another fetch from that would chain fetches for as long as
+      // the queue cannot drain.
+      let isAlreadyRetrying = isRetryingAfterResume.withValue {
+        defer { $0 = true }
+        return $0
+      }
+      guard !isAlreadyRetrying else { return }
+      // Retry inside CKSyncEngine's own serial event delivery: a fetch
+      // brackets itself with will/didFetchChanges events, and every event
+      // retries its scope's unapplied events first.
+      Task { [weak self] in
+        guard let self else { return }
+        defer { self.isRetryingAfterResume.setValue(false) }
+        await self.withActivity("retryAfterResume") {
+          try? await self.fetchChanges()
+        }
       }
     }
 

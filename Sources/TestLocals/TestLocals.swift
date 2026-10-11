@@ -7,6 +7,7 @@
   @TaskLocal package var startImmediately = true
   @TaskLocal package var attachMetadatabase = false
   @TaskLocal package var accountStatus = CKAccountStatus.available
+  @TaskLocal package var observesSuspensionNotifications = false
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   @TaskLocal package var syncEngineDelegate: (any SyncEngineDelegate)? = nil
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)

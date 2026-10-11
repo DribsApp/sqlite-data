@@ -18,6 +18,25 @@
 
   let recordingActivity = RecordingActivity()
 
+  /// Like the host's hold from the background: entering the retry's activity
+  /// resumes the database, leaving it suspends it again.
+  final class ResumingActivity: SyncEngineActivity {
+    let retries = LockIsolated(0)
+    let retriesInFlight = LockIsolated(0)
+    func run<T: Sendable>(_ name: String, _ work: @Sendable () async -> T) async -> T {
+      guard name == "retryAfterResume" else { return await work() }
+      retries.withValue { $0 += 1 }
+      retriesInFlight.withValue { $0 += 1 }
+      NotificationCenter.default.post(name: Database.resumeNotification, object: nil)
+      let result = await work()
+      NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
+      retriesInFlight.withValue { $0 -= 1 }
+      return result
+    }
+  }
+
+  let resumingActivity = ResumingActivity()
+
   extension BaseCloudKitTests {
     @MainActor
     @Suite(.serialized, .taskLocal($syncEngineActivity, recordingActivity))
@@ -38,6 +57,318 @@
         _ = await syncEngine.nextRecordZoneChangeBatch(syncEngine: syncEngine.private)
         #expect(recordingActivity.names.value == ["nextRecordZoneChangeBatch"])
       }
+    }
+
+    /// Both suites post the REAL GRDB notifications, which reach every pool
+    /// opened with `observesSuspensionNotifications` in the process. Only
+    /// `SuspensionRetryTests` opens such pools, but a suspend posted by
+    /// `SuspensionNotObservedTests` would still hit them if the two ran at
+    /// the same time, so they share one serialized parent.
+    @Suite(.serialized)
+    struct SuspensionNotificationTests {
+      /// Opens its pool with `observesSuspensionNotifications`.
+      @MainActor
+      @Suite(.serialized, .taskLocal($observesSuspensionNotifications, true))
+      final class SuspensionRetryTests: BaseCloudKitTests, @unchecked Sendable {
+        func suspend() {
+          NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
+        }
+        func resume() {
+          NotificationCenter.default.post(name: Database.resumeNotification, object: nil)
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        func remindersListRecord() -> CKRecord {
+          let record = CKRecord(
+            recordType: RemindersList.tableName,
+            recordID: RemindersList.recordID(for: 1)
+          )
+          record.setValue(1, forKey: "id", at: now)
+          record.setValue("Personal", forKey: "title", at: now)
+          return record
+        }
+
+        /// Handles an event while the database is suspended. The handlers
+        /// report the failed write (`withErrorReporting`), which is the
+        /// expected production behaviour here, not a test failure.
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        func handleWhileSuspended(
+          _ event: SyncEngine.Event,
+          syncEngine engine: (any SyncEngineProtocol)? = nil
+        ) async {
+          let engine = engine ?? syncEngine.private
+          await withKnownIssue(isIntermittent: true) {
+            await syncEngine.handleEvent(event, syncEngine: engine)
+          }
+        }
+
+        func serialization(_ tag: String) throws -> CKSyncEngine.State.Serialization {
+          let json = #"{"data":"\#(Data(tag.utf8).base64EncodedString())"}"#
+          return try JSONDecoder().decode(
+            CKSyncEngine.State.Serialization.self,
+            from: Data(json.utf8)
+          )
+        }
+
+        /// The persisted serialization of the private scope, JSON-encoded so
+        /// it can be compared (the type is not `Equatable`).
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        func persistedPrivateState() async throws -> String? {
+          let data = try await syncEngine.metadatabase.read { db in
+            try StateSerialization.find(#bind(.private)).select(\.data).fetchOne(db)
+          }
+          return try data.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
+        }
+
+        func encoded(_ serialization: CKSyncEngine.State.Serialization) throws -> String {
+          String(decoding: try JSONEncoder().encode(serialization), as: UTF8.self)
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func fetchedBatchInterruptedBySuspensionIsReappliedOnTheNextEvent() async throws {
+          defer { resume() }
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          // WAL reads still work while suspended; the write did not.
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 0)
+
+          resume()
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func batchAppliedWithoutSuspensionIsNotRetried() async throws {
+          await syncEngine.handleEvent(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: []),
+            syncEngine: syncEngine.private
+          )
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
+          try await userDatabase.userWrite { db in try RemindersList.find(1).delete().execute(db) }
+          // Only the local row matters here, not the upload it enqueued.
+          syncEngine.private.state.removePendingChanges()
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          // Nothing was queued, so the deleted row stays deleted.
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 0)
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func stopClearsDeferredState() async throws {
+          defer { resume() }
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          resume()
+          syncEngine.stop()
+          try await syncEngine.start()
+          try await syncEngine.processPendingDatabaseChanges(scope: .private)
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          // The restarted engine fetches from its saved token instead; the
+          // stale queue must not be replayed into it.
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 0)
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func stateUpdateIsHeldUntilTheInterruptedBatchApplies() async throws {
+          defer { resume() }
+          let state = try serialization("after-batch")
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          // Still suspended: the retry before the state update fails again,
+          // so the state must be held, not written.
+          await handleWhileSuspended(.stateUpdate(stateSerialization: state))
+          #expect(try await persistedPrivateState() == nil)
+          resume()
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          #expect(try await persistedPrivateState() == encoded(state))
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func resumeRetriesTheQueueAndSavesTheHeldState() async throws {
+          defer { resume() }
+          let state = try serialization("held")
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          await handleWhileSuspended(.stateUpdate(stateSerialization: state))
+          #expect(try await persistedPrivateState() == nil)
+
+          // Something new on the server, so the fetch the resume starts
+          // delivers an event (the mock delivers none for an empty fetch).
+          let other = CKRecord(
+            recordType: RemindersList.tableName,
+            recordID: RemindersList.recordID(for: 2)
+          )
+          other.setValue(2, forKey: "id", at: now)
+          other.setValue("Work", forKey: "title", at: now)
+          _ = try syncEngine.modifyRecords(scope: .private, saving: [other])
+
+          // No event from the test: the resume alone has to drive the retry.
+          resume()
+          let deadline = ContinuousClock.now + .seconds(15)
+          while try await persistedPrivateState() == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+          }
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 2)
+          #expect(try await persistedPrivateState() == encoded(state))
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func newerStateUpdateSupersedesTheHeldOne() async throws {
+          defer { resume() }
+          let older = try serialization("older")
+          let newer = try serialization("newer")
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          await handleWhileSuspended(.stateUpdate(stateSerialization: older))
+          resume()
+          // The retry drains the queue first, then this state is saved; the
+          // older held one must not be written over it, then or on any later
+          // event.
+          await syncEngine.handleEvent(
+            .stateUpdate(stateSerialization: newer),
+            syncEngine: syncEngine.private
+          )
+          #expect(try await persistedPrivateState() == encoded(newer))
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
+          #expect(try await persistedPrivateState() == encoded(newer))
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func eventsFromAStoppedEngineAreNotDeferred() async throws {
+          defer { resume() }
+          let stoppedEngine = syncEngine.private
+          syncEngine.stop()
+          try await syncEngine.start()
+          try await syncEngine.processPendingDatabaseChanges(scope: .private)
+          // A delivery still in flight from the engine `stop()` discarded.
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: []),
+            syncEngine: stoppedEngine
+          )
+          await handleWhileSuspended(
+            .stateUpdate(stateSerialization: try serialization("stale")),
+            syncEngine: stoppedEngine
+          )
+          resume()
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          // The restarted engine fetches from its own saved token; nothing of
+          // the stopped engine's may be replayed or saved into it.
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 0)
+          #expect(try await persistedPrivateState() == nil)
+        }
+      }
+
+      @MainActor
+      @Suite(
+        .serialized,
+        .taskLocal($observesSuspensionNotifications, true),
+        .taskLocal($syncEngineActivity, resumingActivity)
+      )
+      final class SuspensionResumeRetryTests: BaseCloudKitTests, @unchecked Sendable {
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func retryAfterResumeDoesNotRestartItselfWhileTheQueueCannotDrain() async throws {
+          resumingActivity.retries.setValue(0)
+          NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
+          defer {
+            // Drop the queue first: a resume with something still queued
+            // starts another retry, whose activity would suspend the pools of
+            // whichever test runs next.
+            syncEngine.stop()
+            NotificationCenter.default.post(name: Database.resumeNotification, object: nil)
+          }
+          let record = CKRecord(
+            recordType: RemindersList.tableName,
+            recordID: RemindersList.recordID(for: 1)
+          )
+          record.setValue(1, forKey: "id", at: now)
+          record.setValue("Personal", forKey: "title", at: now)
+          await withKnownIssue(isIntermittent: true) {
+            await syncEngine.handleEvent(
+              .fetchedRecordZoneChanges(modifications: [record], deletions: []),
+              syncEngine: syncEngine.private
+            )
+          }
+
+          // The mock's fetch delivers no event for an empty server, so the
+          // queue stays put: the retry's own resume must not start another.
+          NotificationCenter.default.post(name: Database.resumeNotification, object: nil)
+          let deadline = ContinuousClock.now + .seconds(15)
+          while resumingActivity.retries.value == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+          }
+          try await Task.sleep(for: .milliseconds(300))
+          while resumingActivity.retriesInFlight.value > 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+          }
+          #expect(resumingActivity.retries.value == 1)
+        }
+      }
+
+      @MainActor
+      @Suite(.serialized)
+      final class SuspensionNotObservedTests: BaseCloudKitTests, @unchecked Sendable {
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func notObservingSuspensionNeverDefers() async throws {
+          NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
+          defer { NotificationCenter.default.post(name: Database.resumeNotification, object: nil) }
+          let record = CKRecord(
+            recordType: RemindersList.tableName,
+            recordID: RemindersList.recordID(for: 1)
+          )
+          record.setValue(1, forKey: "id", at: now)
+          record.setValue("Personal", forKey: "title", at: now)
+          await syncEngine.handleEvent(
+            .fetchedRecordZoneChanges(modifications: [record], deletions: []),
+            syncEngine: syncEngine.private
+          )
+          // This pool ignores the notification, so the write lands and nothing is deferred.
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
+        }
+      }
+    }  // SuspensionNotificationTests
+  }
+
+  /// The overlap rule `SyncEngine` applies to each covered event.
+  @Suite struct DatabaseSuspensionStateTests {
+    @Test func eventWithNoSuspensionDidNotOverlap() {
+      let state = DatabaseSuspensionState()
+      #expect(state.overlapsSuspension(since: state) == false)
+    }
+
+    @Test func suspensionThatEndedDuringTheEventOverlapped() {
+      var state = DatabaseSuspensionState()
+      let before = state
+      state.didSuspend()
+      state.didResume()
+      #expect(state.overlapsSuspension(since: before))
+    }
+
+    @Test func eventEndingWhileSuspendedOverlapped() {
+      var state = DatabaseSuspensionState()
+      let before = state
+      state.didSuspend()
+      #expect(state.overlapsSuspension(since: before))
+    }
+
+    @Test func eventStartingWhileSuspendedOverlappedEvenIfResumedByTheEnd() {
+      var state = DatabaseSuspensionState()
+      state.didSuspend()
+      let before = state
+      state.didResume()
+      // No new suspension began during the event, but it started while the
+      // writer was refusing writes.
+      #expect(state.overlapsSuspension(since: before))
     }
   }
 #endif

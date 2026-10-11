@@ -47,6 +47,16 @@
       #expect(r11 == [])
     }
 
+    @Test func scopeIsBlockedOnlyWhileItHasUnappliedEvents() {
+      var deferred = Deferred()
+      #expect(deferred.isBlocked(scope: .private) == false)
+      deferred.recordUnapplied("a", scope: .private)
+      #expect(deferred.isBlocked(scope: .private))
+      #expect(deferred.isBlocked(scope: .shared) == false)
+      _ = deferred.takeUnapplied(scope: .private)
+      #expect(deferred.isBlocked(scope: .private) == false)
+    }
+
     @Test func resetDropsEverything() {
       var deferred = Deferred()
       deferred.recordUnapplied("a", scope: .private)

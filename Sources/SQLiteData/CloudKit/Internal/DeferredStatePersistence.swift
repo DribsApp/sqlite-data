@@ -30,6 +30,12 @@
       unapplied.removeValue(forKey: scope) ?? []
     }
 
+    /// Whether the scope has unapplied events. While it does, a newer event of
+    /// the scope must queue behind them rather than apply out of order.
+    package func isBlocked(scope: CKDatabase.Scope) -> Bool {
+      !(unapplied[scope] ?? []).isEmpty
+    }
+
     /// Holds `state` (replacing any older held one) and returns true when the
     /// scope has unapplied events; returns false, holding nothing, otherwise.
     package mutating func holdIfBlocked(_ state: State, scope: CKDatabase.Scope) -> Bool {
@@ -47,6 +53,33 @@
     package mutating func reset() {
       unapplied = [:]
       heldState = [:]
+    }
+  }
+
+  /// What `SyncEngine` knows about GRDB's suspension notifications, for
+  /// deciding whether an event's writes may have been refused.
+  package struct DatabaseSuspensionState: Sendable {
+    /// Suspensions begun so far. A change across an event means a suspension
+    /// started while it ran, even if it also ended before the event did.
+    package private(set) var suspendCount = 0
+    package private(set) var isSuspended = false
+
+    package init() {}
+
+    package mutating func didSuspend() {
+      suspendCount += 1
+      isSuspended = true
+    }
+
+    package mutating func didResume() {
+      isSuspended = false
+    }
+
+    /// Whether work that began at `before` and ended at `self` may have run
+    /// while the database refused writes: it started suspended, ended
+    /// suspended, or a suspension began in between.
+    package func overlapsSuspension(since before: Self) -> Bool {
+      before.isSuspended || isSuspended || suspendCount != before.suspendCount
     }
   }
 #endif

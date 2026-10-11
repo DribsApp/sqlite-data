@@ -85,9 +85,11 @@ extension ScopedModel {
 @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
 func database(
   containerIdentifier: String,
-  attachMetadatabase: Bool
+  attachMetadatabase: Bool,
+  observesSuspensionNotifications: Bool = false
 ) throws -> DatabasePool {
   var configuration = Configuration()
+  configuration.observesSuspensionNotifications = observesSuspensionNotifications
   configuration.prepareDatabase { db in
     if attachMetadatabase {
       try db.attachMetadatabase(containerIdentifier: containerIdentifier)
