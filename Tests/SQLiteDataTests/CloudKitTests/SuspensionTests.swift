@@ -23,18 +23,24 @@
   /// else a test reports is still a failure.
   func isSuspensionIssue(_ issue: Issue) -> Bool {
     if let error = issue.error as? DatabaseError {
-      return error.isInterruptionError
+      return error.isSuspensionShaped
     }
+    // An issue recorded from a message alone: the same three errors, as
+    // `DatabaseError.description` renders them.
     let text = issue.comments.map(\.rawValue).joined(separator: " ")
-    return text.contains("Database is suspended") || text.contains("interrupted")
+    return text.contains("SQLite error 4: Database is suspended")
+      || text.contains("SQLite error 4: Transaction was aborted")
+      || text.contains("SQLite error 9: ")
   }
 
-  /// A SQL function that runs `action` the first time it is called, then
-  /// does nothing; plus a TEMP trigger calling it after every insert into
-  /// "remindersLists". Both live on the pool's single writer connection.
+  /// A SQL function that runs `action` the first time it is called (every
+  /// time, with `everyTime`), then does nothing; plus a TEMP trigger calling
+  /// it after every insert into "remindersLists". Both live on the pool's
+  /// single writer connection.
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   func onFirstRemindersListInsert(
     in userDatabase: UserDatabase,
+    everyTime: Bool = false,
     _ action: @escaping @Sendable () throws -> Void
   ) async throws {
     let armed = LockIsolated(true)
@@ -43,7 +49,7 @@
         function: DatabaseFunction("sqlitedata_test_onFirstInsert", argumentCount: 0, pure: false) {
           _ in
           let isFirst = armed.withValue {
-            defer { $0 = false }
+            defer { $0 = everyTime }
             return $0
           }
           if isFirst { try action() }
@@ -355,6 +361,52 @@
         }
 
         @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func recurringErrorWithoutSuspensionIsGivenUpAfterTheCap() async throws {
+          // Every insert fails the way a suspended writer's does, but nothing
+          // is ever suspended: not a suspension, and it will not go away.
+          let attempts = LockIsolated(0)
+          try await onFirstRemindersListInsert(in: userDatabase, everyTime: true) {
+            attempts.withValue { $0 += 1 }
+            throw DatabaseError(resultCode: .SQLITE_ABORT, message: "Database is suspended")
+          }
+          let held = try serialization("held")
+          let later = try serialization("later")
+
+          // Attempt 1.
+          await withKnownIssue(isIntermittent: true) {
+            await syncEngine.handleEvent(
+              .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: []),
+              syncEngine: syncEngine.private
+            )
+          } matching: { isSuspensionIssue($0) }
+          // Attempt 2, before the state update: still blocked, so it is held.
+          await withKnownIssue(isIntermittent: true) {
+            await syncEngine.handleEvent(
+              .stateUpdate(stateSerialization: held),
+              syncEngine: syncEngine.private
+            )
+          } matching: { isSuspensionIssue($0) }
+          #expect(try await persistedPrivateState() == nil)
+
+          // Attempt 3 reaches the cap: the event is dropped, which unblocks
+          // the scope and releases the held state.
+          await withKnownIssue(isIntermittent: true) {
+            await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          } matching: { isSuspensionIssue($0) }
+          #expect(attempts.value == 3)
+          #expect(try await persistedPrivateState() == encoded(held))
+
+          // No longer queued: nothing retries it, and a new state saves at once.
+          await syncEngine.handleEvent(.willFetchChanges, syncEngine: syncEngine.private)
+          await syncEngine.handleEvent(
+            .stateUpdate(stateSerialization: later),
+            syncEngine: syncEngine.private
+          )
+          #expect(attempts.value == 3)
+          #expect(try await persistedPrivateState() == encoded(later))
+        }
+
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
         @Test func retryKeepsBatchOrderWhenASuspensionInterruptsIt() async throws {
           defer { resume() }
           suspend()
@@ -535,6 +587,19 @@
 
   /// The overlap rule `SyncEngine` applies to each covered event.
   @Suite struct DatabaseSuspensionStateTests {
+    @Test func onlyGRDBSuspensionErrorsAreSuspensionShaped() {
+      func error(_ code: ResultCode, _ message: String? = nil) -> DatabaseError {
+        DatabaseError(resultCode: code, message: message)
+      }
+      #expect(error(.SQLITE_ABORT, "Database is suspended").isSuspensionShaped)
+      #expect(error(.SQLITE_ABORT, "Transaction was aborted").isSuspensionShaped)
+      #expect(error(.SQLITE_INTERRUPT, "interrupted").isSuspensionShaped)
+      #expect(!error(.SQLITE_ABORT, "Snapshot is lost.").isSuspensionShaped)
+      #expect(!error(.SQLITE_ABORT, "app abort").isSuspensionShaped)
+      #expect(!error(.SQLITE_ABORT_ROLLBACK).isSuspensionShaped)
+      #expect(!error(.SQLITE_CONSTRAINT).isSuspensionShaped)
+    }
+
     @Test func eventWithNoSuspensionDidNotOverlap() {
       let state = DatabaseSuspensionState()
       #expect(state.overlapsSuspension(since: state) == false)

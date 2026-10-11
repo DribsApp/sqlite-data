@@ -67,9 +67,18 @@
     // their events unapplied.
     private let suspension = LockIsolated(DatabaseSuspensionState())
     private let deferredState = LockIsolated(
-      DeferredStatePersistence<Event, CKSyncEngine.State.Serialization>()
+      DeferredStatePersistence<DeferredEvent, CKSyncEngine.State.Serialization>()
     )
     private let suspensionObservers = LockIsolated<[any NSObjectProtocol]>([])
+    /// A queued event, with how many attempts in a row failed with a
+    /// suspension-shaped error while no suspension activity was seen.
+    private struct DeferredEvent: Sendable {
+      let event: Event
+      var attemptsWithoutSuspension = 0
+    }
+    /// After this many such attempts the event is given up on (see
+    /// `applyDetectingSuspension`).
+    private static let maxAttemptsWithoutSuspension = 3
     private let isRetryingAfterResume = LockIsolated(false)
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
 
@@ -1145,10 +1154,12 @@
     /// the running engines: a delivery still in flight from an engine that
     /// `stop()` discarded must not queue events for, or hold or release state
     /// into, the engines that replaced it. Returns nil for such an engine.
+    private typealias Deferred =
+      DeferredStatePersistence<DeferredEvent, CKSyncEngine.State.Serialization>
+
     private func withDeferredState<R: Sendable>(
       of syncEngine: any SyncEngineProtocol,
-      _ body: @Sendable (inout DeferredStatePersistence<Event, CKSyncEngine.State.Serialization>)
-        -> R
+      _ body: @Sendable (inout Deferred) -> R
     ) -> R? {
       syncEngines.withValue { _ in
         // Re-entrant: `syncEngines`' lock is recursive.
@@ -1189,9 +1200,13 @@
           // An older event of this scope is still unapplied (the retry above
           // failed again). Applying this one first could reorder the
           // batches, e.g. resurrect a record a later batch deletes.
-          deferUnapplied([event], scope: scope, syncEngine: syncEngine)
+          deferUnapplied([DeferredEvent(event: event)], scope: scope, syncEngine: syncEngine)
         } else {
-          await applyDetectingSuspension(event, scope: scope, syncEngine: syncEngine)
+          await applyDetectingSuspension(
+            DeferredEvent(event: event),
+            scope: scope,
+            syncEngine: syncEngine
+          )
         }
       default:
         await handleEventNow(event, syncEngine: syncEngine)
@@ -1214,8 +1229,8 @@
       guard !events.isEmpty else { return }
       logger.log("sqlitedata-diag: retrying \(events.count) suspension-interrupted events")
       for (index, event) in events.enumerated() {
-        let applied = await applyDetectingSuspension(event, scope: scope, syncEngine: syncEngine)
-        guard applied else {
+        let isDone = await applyDetectingSuspension(event, scope: scope, syncEngine: syncEngine)
+        guard isDone else {
           // Keep the rest queued, in order, behind the one that failed again.
           deferUnapplied(Array(events[(index + 1)...]), scope: scope, syncEngine: syncEngine)
           return
@@ -1224,7 +1239,7 @@
     }
 
     private func deferUnapplied(
-      _ events: [Event],
+      _ events: [DeferredEvent],
       scope: CKDatabase.Scope,
       syncEngine: any SyncEngineProtocol
     ) {
@@ -1236,37 +1251,61 @@
       }
     }
 
-    /// Every write in the handlers is wrapped in `withErrorReporting`, so a
-    /// failure from suspension is invisible from here. Whether a
-    /// suspension overlapped the event is not: retrying an event that did
-    /// apply is harmless (upserts are idempotent; the relaunch path
-    /// re-delivers batches the same way).
+    /// Every write in the handlers is wrapped in `withErrorReporting`, which
+    /// reports a failure and moves on; the handlers do not return it. So this
+    /// infers a suspension failure from two signals, either of which marks
+    /// the event unapplied:
+    /// - the suspension state moved (or was suspended) across the event;
+    /// - one of its writes reported a suspension-shaped GRDB error (see
+    ///   `DatabaseError.isSuspensionShaped`). This one does not depend on the
+    ///   order in which NotificationCenter calls GRDB's observers and ours.
+    ///   The recorder is added to the current reporters, so the host's
+    ///   reporters still get every issue.
     ///
-    /// Two signals, either of which marks the event unapplied: the
-    /// suspension state moved (or was suspended) across it, or one of its
-    /// writes reported a GRDB interruption error (`SQLITE_ABORT` /
-    /// `SQLITE_INTERRUPT`, which is what a suspended or interrupted writer
-    /// throws). The second does not depend on the order in which
-    /// NotificationCenter calls GRDB's observers and ours. The recorder is
-    /// added to the current reporters, so the host's reporters still get
-    /// every issue.
+    /// Retrying an event that did apply is harmless (upserts are idempotent;
+    /// the relaunch path re-delivers batches the same way).
     ///
-    /// Returns whether the event ran clear of any suspension.
+    /// The error signal alone can also fire for a cause that is not a
+    /// suspension and recurs on every attempt (a host `interrupt()`, or an app
+    /// function raising the same error). Deferring such an event forever
+    /// would block its scope for good: later events queue behind it and its
+    /// state is never saved, on every launch. So after
+    /// `maxAttemptsWithoutSuspension` attempts in a row that saw the error
+    /// but no suspension activity, the event is given up on and treated as
+    /// applied: its error was already reported, which is what upstream does
+    /// with every failure. An attempt that does overlap a suspension resets
+    /// the count, because a real suspension is transient.
+    ///
+    /// Returns whether the event is done with (applied, or given up on);
+    /// false when it was queued again.
     @discardableResult
     private func applyDetectingSuspension(
-      _ event: Event,
+      _ deferred: DeferredEvent,
       scope: CKDatabase.Scope,
       syncEngine: any SyncEngineProtocol
     ) async -> Bool {
+      let event = deferred.event
       let interruptions = InterruptionRecorder()
       let before = suspension.value
       await withIssueReporters(IssueReporters.current + [interruptions]) {
         await handleEventNow(event, syncEngine: syncEngine)
       }
-      guard
-        interruptions.sawInterruption || suspension.value.overlapsSuspension(since: before)
-      else { return true }
-      deferUnapplied([event], scope: scope, syncEngine: syncEngine)
+      let sawSuspension = suspension.value.overlapsSuspension(since: before)
+      guard sawSuspension || interruptions.sawInterruption else { return true }
+      var deferred = deferred
+      deferred.attemptsWithoutSuspension =
+        sawSuspension ? 0 : deferred.attemptsWithoutSuspension + 1
+      if deferred.attemptsWithoutSuspension >= Self.maxAttemptsWithoutSuspension {
+        logger.log(
+          """
+          sqlitedata-diag: gave up on \(event.description, privacy: .public) after \
+          \(deferred.attemptsWithoutSuspension) interrupted attempts with no suspension; \
+          treating it as applied
+          """
+        )
+        return true
+      }
+      deferUnapplied([deferred], scope: scope, syncEngine: syncEngine)
       logger.log(
         """
         sqlitedata-diag: \(event.description, privacy: .public) overlapped a database \
@@ -2652,8 +2691,37 @@
     }
 
     private func record(_ error: any Error) {
-      guard (error as? DatabaseError)?.isInterruptionError == true else { return }
+      guard (error as? DatabaseError)?.isSuspensionShaped == true else { return }
       _sawInterruption.setValue(true)
+    }
+  }
+
+  extension DatabaseError {
+    /// Whether this is an error GRDB's suspension produces (GRDB 7.11,
+    /// `Database.swift`), as opposed to any `SQLITE_ABORT`/`SQLITE_INTERRUPT`
+    /// (`isInterruptionError`):
+    /// - `SQLITE_ABORT` "Database is suspended": `checkForSuspensionViolation`
+    ///   refuses a statement that could take a write lock while suspended;
+    /// - `SQLITE_ABORT` "Transaction was aborted": `checkForAbortedTransaction`,
+    ///   after the interrupt that `suspend()` issues rolled the transaction
+    ///   back under a transaction block;
+    /// - `SQLITE_INTERRUPT`: that interrupt, caught by SQLite mid-statement
+    ///   (`sqlite3_interrupt`; the message depends on where SQLite noticed).
+    ///
+    /// Matched on the exact (extended) code, so `SQLITE_ABORT_ROLLBACK` and
+    /// other aborts with GRDB's or an app's own messages ("Snapshot is lost",
+    /// a function raising `SQLITE_ABORT`) are not. A host's own `interrupt()`
+    /// still matches and cannot be told apart; the retry cap in
+    /// `SyncEngine.applyDetectingSuspension` bounds that case.
+    package var isSuspensionShaped: Bool {
+      switch extendedResultCode {
+      case .SQLITE_INTERRUPT:
+        return true
+      case .SQLITE_ABORT:
+        return message == "Database is suspended" || message == "Transaction was aborted"
+      default:
+        return false
+      }
     }
   }
 
