@@ -59,6 +59,12 @@
     // `syncEngines` before `deferredState`, never the reverse, so that
     // `stop()`/`start()` swap the engines and drop what the old ones
     // deferred in one step.
+    // Starts out not suspended: the host must build the engine before it
+    // starts posting suspensions (Dribs builds it in `DatabaseLaunchRecovery`
+    // before `DatabaseSuspensionLifecycle.install()`). An engine built while
+    // the database is already suspended would not know until the next
+    // notification; the interruption errors its writes report still mark
+    // their events unapplied.
     private let suspension = LockIsolated(DatabaseSuspensionState())
     private let deferredState = LockIsolated(
       DeferredStatePersistence<Event, CKSyncEngine.State.Serialization>()
@@ -337,8 +343,15 @@
         // GRDB's own notifications, on the center GRDB observes. An event
         // whose writes overlapped a suspension is retried (see
         // `DeferredStatePersistence`). The pools registered their observers
-        // when they opened, before this, so on a resume the pool is writable
-        // again before `isSuspended` clears.
+        // when they opened, before these. NotificationCenter calls observers
+        // in registration order in practice (not a documented guarantee), so:
+        // - on a suspend, GRDB interrupts the writer before `suspendCount`
+        //   moves. A handler whose write was just aborted can finish in that
+        //   gap and look clean to the counter, which is why
+        //   `applyDetectingSuspension` also watches for reported interruption
+        //   errors, a signal that does not depend on the order;
+        // - on a resume, the pool is writable again before `isSuspended`
+        //   clears.
         let center = NotificationCenter.default
         suspensionObservers.withValue {
           $0 = [
@@ -1106,6 +1119,21 @@
       }
     }
 
+    /// Whether `syncEngine` is the running engine for its scope.
+    private func isCurrentEngine(_ syncEngine: any SyncEngineProtocol) -> Bool {
+      syncEngines.withValue { engines in
+        guard engines.isRunning else { return false }
+        switch syncEngine.database.databaseScope {
+        case .private:
+          return engines.private === syncEngine
+        case .shared:
+          return engines.shared === syncEngine
+        default:
+          return false
+        }
+      }
+    }
+
     /// Only an engine whose user database obeys GRDB's suspension
     /// notifications tracks them. Any other pool keeps writing through a
     /// posted suspension, so there is nothing to retry.
@@ -1122,11 +1150,9 @@
       _ body: @Sendable (inout DeferredStatePersistence<Event, CKSyncEngine.State.Serialization>)
         -> R
     ) -> R? {
-      syncEngines.withValue { engines in
-        guard
-          engines.isRunning,
-          engines.private === syncEngine || engines.shared === syncEngine
-        else { return nil }
+      syncEngines.withValue { _ in
+        // Re-entrant: `syncEngines`' lock is recursive.
+        guard isCurrentEngine(syncEngine) else { return nil }
         return deferredState.withValue { body(&$0) }
       }
     }
@@ -1136,6 +1162,7 @@
       syncEngine: any SyncEngineProtocol
     ) async {
       guard tracksSuspension, withDeferredState(of: syncEngine, { _ in () }) != nil else {
+        // `handleStateUpdate` drops a stopped engine's state either way.
         await handleEventNow(event, syncEngine: syncEngine)
         return
       }
@@ -1180,6 +1207,9 @@
       scope: CKDatabase.Scope,
       syncEngine: any SyncEngineProtocol
     ) async {
+      // The scope's queue is empty while these retry. That is safe only
+      // because CKSyncEngine delivers one engine's events serially: no other
+      // event of this scope can run (and find the queue empty) meanwhile.
       let events = withDeferredState(of: syncEngine) { $0.takeUnapplied(scope: scope) } ?? []
       guard !events.isEmpty else { return }
       logger.log("sqlitedata-diag: retrying \(events.count) suspension-interrupted events")
@@ -1212,6 +1242,15 @@
     /// apply is harmless (upserts are idempotent; the relaunch path
     /// re-delivers batches the same way).
     ///
+    /// Two signals, either of which marks the event unapplied: the
+    /// suspension state moved (or was suspended) across it, or one of its
+    /// writes reported a GRDB interruption error (`SQLITE_ABORT` /
+    /// `SQLITE_INTERRUPT`, which is what a suspended or interrupted writer
+    /// throws). The second does not depend on the order in which
+    /// NotificationCenter calls GRDB's observers and ours. The recorder is
+    /// added to the current reporters, so the host's reporters still get
+    /// every issue.
+    ///
     /// Returns whether the event ran clear of any suspension.
     @discardableResult
     private func applyDetectingSuspension(
@@ -1219,9 +1258,14 @@
       scope: CKDatabase.Scope,
       syncEngine: any SyncEngineProtocol
     ) async -> Bool {
+      let interruptions = InterruptionRecorder()
       let before = suspension.value
-      await handleEventNow(event, syncEngine: syncEngine)
-      guard suspension.value.overlapsSuspension(since: before) else { return true }
+      await withIssueReporters(IssueReporters.current + [interruptions]) {
+        await handleEventNow(event, syncEngine: syncEngine)
+      }
+      guard
+        interruptions.sawInterruption || suspension.value.overlapsSuspension(since: before)
+      else { return true }
       deferUnapplied([event], scope: scope, syncEngine: syncEngine)
       logger.log(
         """
@@ -1238,7 +1282,9 @@
       // One retry at a time. The retry's own activity can resume the database
       // (the host's hold does, from the background), which lands here again;
       // starting another fetch from that would chain fetches for as long as
-      // the queue cannot drain.
+      // the queue cannot drain. A genuine resume that arrives while a retry
+      // runs is dropped too; that is safe, because the queue also drains on
+      // the scope's next event.
       let isAlreadyRetrying = isRetryingAfterResume.withValue {
         defer { $0 = true }
         return $0
@@ -1651,6 +1697,16 @@
     ) async {
       await withErrorReporting(.sqliteDataCloudKitFailure) {
         try await userDatabase.write { db in
+          // Checked inside the write: a state from an engine `stop()`
+          // discarded (still in flight, or released from the held state)
+          // must not land after it. `deleteLocalData()` stops the engine and
+          // then erases the metadatabase in later writes, which queue behind
+          // this one; an old token written after the erase would make the
+          // next launch resume past changes whose local rows were deleted.
+          guard isCurrentEngine(syncEngine) else {
+            logger.log("sqlitedata-diag: dropping sync state from a stopped engine")
+            return
+          }
           try StateSerialization.upsert {
             StateSerialization.Draft(
               scope: syncEngine.database.databaseScope,
@@ -2555,6 +2611,49 @@
           .queryItems?
           .contains(where: { $0.name == "mode" && $0.value == "memory" })
           == true
+    }
+  }
+
+  /// Notes whether any reported error was a GRDB interruption error. It
+  /// reports nothing itself.
+  private final class InterruptionRecorder: IssueReporter, Sendable {
+    private let _sawInterruption = LockIsolated(false)
+    var sawInterruption: Bool { _sawInterruption.value }
+
+    func reportIssue(
+      _ message: @autoclosure () -> String?,
+      severity: IssueSeverity,
+      fileID: StaticString,
+      filePath: StaticString,
+      line: UInt,
+      column: UInt
+    ) {}
+
+    func reportIssue(
+      _ error: any Error,
+      _ message: @autoclosure () -> String?,
+      fileID: StaticString,
+      filePath: StaticString,
+      line: UInt,
+      column: UInt
+    ) {
+      record(error)
+    }
+
+    func expectIssue(
+      _ error: any Error,
+      _ message: @autoclosure () -> String?,
+      fileID: StaticString,
+      filePath: StaticString,
+      line: UInt,
+      column: UInt
+    ) {
+      record(error)
+    }
+
+    private func record(_ error: any Error) {
+      guard (error as? DatabaseError)?.isInterruptionError == true else { return }
+      _sawInterruption.setValue(true)
     }
   }
 

@@ -42,8 +42,10 @@
         }
       }
 
+      // The `true` case lives in `SuspensionNotificationTests`, serialized
+      // with the suites that post GRDB's suspension notifications.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test(arguments: [false, true])
+      @Test(arguments: [false])
       func metadatabaseInheritsSuspensionNotificationConfiguration(
         _ observesSuspensionNotifications: Bool
       ) async throws {
