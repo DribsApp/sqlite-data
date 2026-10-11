@@ -35,6 +35,7 @@
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
+    let activity: (any SyncEngineActivity)?
     let defaultSyncEngines:
       @Sendable (any DatabaseReader, SyncEngine)
         -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol)
@@ -55,6 +56,11 @@
     // in-memory cache lost.
     private let parkedServerRecords = LockIsolated<[CKRecord.ID: CKRecord]>([:])
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
+
+    func withActivity<T: Sendable>(_ name: String, _ work: @Sendable () async -> T) async -> T {
+      guard let activity else { return await work() }
+      return await activity.run(name, work)
+    }
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
     #endif
@@ -111,7 +117,8 @@
       startImmediately: Bool? = nil,
       delegate: (any SyncEngineDelegate)? = nil,
       logger: Logger = isTesting
-        ? Logger(.disabled) : Logger(subsystem: "SQLiteData", category: "CloudKit")
+        ? Logger(.disabled) : Logger(subsystem: "SQLiteData", category: "CloudKit"),
+      activity: (any SyncEngineActivity)? = nil
     ) throws
     where
       repeat (each T1).PrimaryKey.QueryOutput: IdentifierStringConvertible,
@@ -166,7 +173,8 @@
           logger: logger,
           delegate: delegate,
           tables: allTables,
-          privateTables: allPrivateTables
+          privateTables: allPrivateTables,
+          activity: activity
         )
         try setUpSyncEngine()
         if startImmediately ?? !isTesting {
@@ -215,7 +223,8 @@
         logger: logger,
         delegate: delegate,
         tables: allTables,
-        privateTables: allPrivateTables
+        privateTables: allPrivateTables,
+        activity: activity
       )
       try setUpSyncEngine()
       if startImmediately ?? !isTesting {
@@ -235,13 +244,15 @@
       logger: Logger,
       delegate: (any SyncEngineDelegate)?,
       tables: [any SynchronizableTable],
-      privateTables: [any SynchronizableTable] = []
+      privateTables: [any SynchronizableTable] = [],
+      activity: (any SyncEngineActivity)? = nil
     ) throws {
       let allTables = OrderedSet((tables + privateTables).map(HashableSynchronizedTable.init))
         .map(\.type)
       self.tables = allTables
       self.privateTables = privateTables
       self.delegate = delegate
+      self.activity = activity
 
       let foreignKeysByTableName = Dictionary(
         uniqueKeysWithValues: try userDatabase.read { db in
@@ -540,31 +551,33 @@
         }
       #endif
       let startTask = Task<Void, Never> {
-        await withErrorReporting(.sqliteDataCloudKitFailure) {
-          guard try await container.accountStatus() == .available
-          else { return }
-          syncEngines.withValue {
-            $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
+        await self.withActivity("start") {
+          await withErrorReporting(.sqliteDataCloudKitFailure) {
+            guard try await container.accountStatus() == .available
+            else { return }
+            syncEngines.withValue {
+              $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
+            }
+            try await uploadRecordsToCloudKit(
+              previousRecordTypeByTableName: previousRecordTypeByTableName,
+              currentRecordTypeByTableName: currentRecordTypeByTableName
+            )
+            try await updateLocalFromSchemaChange(
+              previousRecordTypeByTableName: previousRecordTypeByTableName,
+              currentRecordTypeByTableName: currentRecordTypeByTableName
+            )
+            try await cacheUserTables(recordTypes: currentRecordTypes)
+            // Reconcile rows whose pending upload was lost: metadata exists but
+            // no server record was ever stamped and no pending change survives
+            // (e.g. the process died before the not-running trigger path's
+            // fire-and-forget persistence Task ran, or before live engine state
+            // was serialized). Previously this ran only on account sign-IN, so
+            // such rows strand forever on normal launches. Touching them here
+            // re-fires the metadata triggers into the now-running engine; a
+            // no-op when nothing is stranded, and legitimately-pending rows
+            // coalesce by record ID.
+            try await enqueueUnknownRecordsForCloudKit()
           }
-          try await uploadRecordsToCloudKit(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await updateLocalFromSchemaChange(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await cacheUserTables(recordTypes: currentRecordTypes)
-          // Reconcile rows whose pending upload was lost: metadata exists but
-          // no server record was ever stamped and no pending change survives
-          // (e.g. the process died before the not-running trigger path's
-          // fire-and-forget persistence Task ran, or before live engine state
-          // was serialized). Previously this ran only on account sign-IN, so
-          // such rows strand forever on normal launches. Touching them here
-          // re-fires the metadata triggers into the now-running engine; a
-          // no-op when nothing is stranded, and legitimately-pending rows
-          // coalesce by record ID.
-          try await enqueueUnknownRecordsForCloudKit()
         }
       }
       self.startTask.withValue {
@@ -1051,6 +1064,12 @@
     }
 
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
+      await withActivity("handleEvent.\(event.description)") {
+        await self.handleEventNow(event, syncEngine: syncEngine)
+      }
+    }
+
+    private func handleEventNow(_ event: Event, syncEngine: any SyncEngineProtocol) async {
       #if DEBUG
         logger.log(event, syncEngine: syncEngine)
       #endif
@@ -1134,6 +1153,21 @@
     package func nextRecordZoneChangeBatch(
       reason: CKSyncEngine.SyncReason = .scheduled,
       options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions(scope: .all),
+      syncEngine: any SyncEngineProtocol
+    ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+      let batch = await withActivity("nextRecordZoneChangeBatch") {
+        UncheckedSendable(
+          await self.nextRecordZoneChangeBatchNow(
+            reason: reason, options: options, syncEngine: syncEngine
+          )
+        )
+      }
+      return batch.value
+    }
+
+    private func nextRecordZoneChangeBatchNow(
+      reason: CKSyncEngine.SyncReason,
+      options: CKSyncEngine.SendChangesOptions,
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
       var changes = await pendingRecordZoneChanges(options: options, syncEngine: syncEngine)

@@ -9,4 +9,6 @@
   @TaskLocal package var accountStatus = CKAccountStatus.available
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   @TaskLocal package var syncEngineDelegate: (any SyncEngineDelegate)? = nil
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  @TaskLocal package var syncEngineActivity: (any SyncEngineActivity)? = nil
 #endif

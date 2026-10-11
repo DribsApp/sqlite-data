@@ -229,7 +229,8 @@
         logger: Logger(.disabled),
         delegate: delegate,
         tables: tables,
-        privateTables: privateTables
+        privateTables: privateTables,
+        activity: syncEngineActivity
       )
       try setUpSyncEngine()
       if startImmediately {
