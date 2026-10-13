@@ -342,13 +342,38 @@
             queue: nil
           ) { [syncEngines] _ in
             _ = Task { @MainActor in
-              let taskIdentifier = UIApplication.shared.beginBackgroundTask()
-              defer { UIApplication.shared.endBackgroundTask(taskIdentifier) }
               let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
                 ($0.private, $0.shared)
               }
-              try await privateSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
-              try await sharedSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
+              let send = Task {
+                try await privateSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
+                try await sharedSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
+              }
+              // A send can outlast the background budget (a first sync, a
+              // restore's reseed). UIKit kills an app whose task is still open
+              // after its expiration handler returns, so the handler cancels
+              // the send and ends the task itself; the normal path ends it
+              // after the send. Ending is idempotent, whichever comes first.
+              // Begin and end are `NS_SWIFT_NONISOLATED`, so the handler can
+              // end the task from wherever UIKit calls it.
+              let application = UIApplication.shared
+              let taskIdentifier = LockIsolated(UIBackgroundTaskIdentifier.invalid)
+              let endBackgroundTask: @Sendable () -> Void = {
+                let identifier = taskIdentifier.withValue { identifier in
+                  defer { identifier = .invalid }
+                  return identifier
+                }
+                guard identifier != .invalid else { return }
+                application.endBackgroundTask(identifier)
+              }
+              taskIdentifier.setValue(
+                application.beginBackgroundTask(withName: "SQLiteData.sendChanges") {
+                  send.cancel()
+                  endBackgroundTask()
+                }
+              )
+              _ = await send.result
+              endBackgroundTask()
             }
           }
         }
