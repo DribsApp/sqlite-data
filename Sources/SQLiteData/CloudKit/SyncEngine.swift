@@ -2174,6 +2174,22 @@
         syncEngine.state.add(pendingDatabaseChanges: newPendingDatabaseChanges)
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
+      // Saves given up on: CKSyncEngine drops a failed save from its pending
+      // changes unless the error is transient, and nothing here re-enqueues
+      // these, so the row stays unsynced until it is next edited. Grouped by
+      // table and code, so a schema mismatch rejecting a whole table reports
+      // once per batch rather than once per row.
+      struct DroppedSave: Hashable {
+        let recordType: CKRecord.RecordType
+        let code: CKError.Code
+      }
+      var droppedSaves: [DroppedSave: (count: Int, message: String)] = [:]
+      func recordDroppedSave(_ record: CKRecord, _ error: CKError) {
+        droppedSaves[
+          DroppedSave(recordType: record.recordType, code: error.code),
+          default: (0, error.localizedDescription)
+        ].count += 1
+      }
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -2204,6 +2220,7 @@
 
         case .serverRejectedRequest:
           await clearServerRecord()
+          recordDroppedSave(failedRecord, error)
 
         case .referenceViolation:
           guard
@@ -2295,22 +2312,39 @@
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
           break
 
+        // Transient: the sync engine keeps these pending and retries them.
         case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
-          .notAuthenticated, .operationCancelled,
-          .internalError, .partialFailure, .badContainer, .requestRateLimited, .missingEntitlement,
+          .notAuthenticated, .operationCancelled, .requestRateLimited, .serverResponseLost,
+          .accountTemporarilyUnavailable:
+          continue
+
+        case .internalError, .partialFailure, .badContainer, .missingEntitlement,
           .invalidArguments, .resultsTruncated, .assetFileNotFound,
           .assetFileModified, .incompatibleVersion, .constraintViolation, .changeTokenExpired,
           .badDatabase, .quotaExceeded, .limitExceeded, .userDeletedZone, .tooManyParticipants,
           .alreadyShared, .managedAccountRestricted, .participantMayNeedVerification,
-          .serverResponseLost, .assetNotAvailable, .accountTemporarilyUnavailable:
-          continue
+          .assetNotAvailable:
+          recordDroppedSave(failedRecord, error)
         #if canImport(FoundationModels)
           case .participantAlreadyInvited:
             continue
         #endif
         @unknown default:
-          continue
+          recordDroppedSave(failedRecord, error)
         }
+      }
+
+      // A fresh error carries the code alone: the failed save's own error holds
+      // the client record, whose fields are user data.
+      for (droppedSave, dropped) in droppedSaves {
+        reportIssue(
+          CKError(droppedSave.code),
+          """
+          Dropped \(dropped.count) unsent '\(droppedSave.recordType)' \
+          \(dropped.count == 1 ? "save" : "saves") after a non-retryable CloudKit error: \
+          \(dropped.message)
+          """
+        )
       }
 
       let enqueuedUnsyncedRecordID =

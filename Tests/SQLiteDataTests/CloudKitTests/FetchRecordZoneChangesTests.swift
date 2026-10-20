@@ -591,7 +591,13 @@
             Tag(title: "tag")
           }
         }
-        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        // The local save is rejected and dropped; the fetch below replaces the
+        // row with the server's copy.
+        try await withKnownIssue {
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        } matching: { issue in
+          issue.description.contains("Dropped 1 unsent 'tags' save")
+        }
         await modifications.notify()
 
         assertQuery(Tag.all, database: userDatabase.database) {
