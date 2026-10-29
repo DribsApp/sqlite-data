@@ -187,6 +187,27 @@
           #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
         }
 
+        /// A fetch whose batch never landed is not a completed fetch: a host
+        /// waiting for one (Dribs' reseed, before it re-inserts the rows a
+        /// zone-deletion replay would delete) must keep waiting.
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func fetchWithAnUnappliedBatchIsNotCountedAsCompleted() async throws {
+          defer { resume() }
+          let before = syncEngine.completedPrivateFetchCount
+          suspend()
+          await handleWhileSuspended(
+            .fetchedRecordZoneChanges(modifications: [remindersListRecord()], deletions: [])
+          )
+          await handleWhileSuspended(.didFetchChanges)
+          #expect(syncEngine.completedPrivateFetchCount == before)
+
+          resume()
+          // The retry ahead of this event applies the batch first.
+          await syncEngine.handleEvent(.didFetchChanges, syncEngine: syncEngine.private)
+          #expect(try await userDatabase.read { try RemindersList.all.fetchCount($0) } == 1)
+          #expect(syncEngine.completedPrivateFetchCount == before + 1)
+        }
+
         @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
         @Test func batchAppliedWithoutSuspensionIsNotRetried() async throws {
           await syncEngine.handleEvent(

@@ -11,6 +11,7 @@
     package let state: MockSyncEngineState
     package let _fetchChangesScopes = LockIsolated<[CKSyncEngine.FetchChangesOptions.Scope]>([])
     package let _acceptedShareMetadata = LockIsolated<Set<ShareMetadata>>([])
+    package let _cancelOperationsCount = LockIsolated(0)
 
     package init(
       database: MockCloudDatabase,
@@ -131,6 +132,7 @@
     }
 
     package func cancelOperations() async {
+      _cancelOperationsCount.withValue { $0 += 1 }
     }
   }
 

@@ -86,6 +86,8 @@
     private static let maxAttemptsWithoutSuspension = 3
     private let isRetryingAfterResume = LockIsolated(false)
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
+    /// See `completedPrivateFetchCount`.
+    private let completedPrivateFetches = LockIsolated(0)
 
     func withActivity<T: Sendable>(_ name: String, _ work: @Sendable () async -> T) async -> T {
       guard let activity else { return await work() }
@@ -543,12 +545,24 @@
           $0 = nil
         }
       #endif
-      observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
+      let stoppedEngines = observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         syncEngines.withValue {
+          let stoppedEngines = [$0.private, $0.shared].compactMap { $0 }
           $0 = SyncEngines()
           // The next engine starts from the saved token and fetches anything
           // queued here again; nothing deferred by this one may outlive it.
           deferredState.withValue { $0.reset() }
+          return stoppedEngines
+        }
+      }
+      // Discarding the engines does not end their work: a fetch already in
+      // flight keeps its caller waiting, and keeps delivering events, until
+      // CloudKit answers, which may be never. Cancel it. CKSyncEngine cancels
+      // asynchronously and the next start builds new engines, so nothing
+      // waits for this.
+      Task { [stoppedEngines] in
+        for engine in stoppedEngines {
+          await engine.cancelOperations()
         }
       }
     }
@@ -559,6 +573,19 @@
       return syncEngines.withValue {
         $0.isRunning
       }
+    }
+
+    /// The number of private-database fetches that finished with every
+    /// fetched change applied to the local database.
+    ///
+    /// Counts the running private engine's `didFetchChanges` events, but
+    /// only when no batch of the scope is still waiting to be applied (one a
+    /// database suspension interrupted; see `DeferredStatePersistence`).
+    /// Events from engines that ``stop()`` discarded never count. The count
+    /// only grows: read it before an operation and again after it to learn
+    /// whether a complete fetch finished in between. It is not observable.
+    public var completedPrivateFetchCount: Int {
+      completedPrivateFetches.value
     }
 
     private func start() throws -> Task<Void, Never> {
@@ -1205,6 +1232,7 @@
       guard tracksSuspension, withDeferredState(of: syncEngine, { _ in () }) != nil else {
         // `handleStateUpdate` drops a stopped engine's state either way.
         await handleEventNow(event, syncEngine: syncEngine)
+        countCompletedFetchIfApplied(event, syncEngine: syncEngine)
         return
       }
       let scope = syncEngine.database.databaseScope
@@ -1246,6 +1274,19 @@
       {
         await handleStateUpdate(stateSerialization: held, syncEngine: syncEngine)
       }
+      countCompletedFetchIfApplied(event, syncEngine: syncEngine)
+    }
+
+    /// Counts a private `didFetchChanges` from the running engine when the
+    /// scope has nothing left to apply (see `completedPrivateFetchCount`).
+    /// Its unapplied events were retried before this event was handled, so a
+    /// scope still blocked here means part of the fetch never landed.
+    private func countCompletedFetchIfApplied(_ event: Event, syncEngine: any SyncEngineProtocol) {
+      guard case .didFetchChanges = event, syncEngine.database.databaseScope == .private
+      else { return }
+      let isApplied = withDeferredState(of: syncEngine) { !$0.isBlocked(scope: .private) }
+      guard isApplied == true else { return }
+      completedPrivateFetches.withValue { $0 += 1 }
     }
 
     private func retryUnappliedEvents(
