@@ -1,6 +1,7 @@
 #if canImport(CloudKit)
   import CloudKit
   import SQLiteData
+  import os
   import Testing
 
   extension BaseCloudKitTests {
@@ -82,6 +83,27 @@
 
         #expect(try serverTitle(ofList: 1) == "Groceries")
         #expect(!syncEngine.hasChangesAwaitingICloudStorage)
+      }
+
+      // The next launch's engine knows before it starts. Reading it only once
+      // start() had re-queued the saves showed false, then true, at every
+      // launch, which an observer takes for the account filling up again.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func freshEngineKnowsAboutBlockedChangesBeforeStarting() async throws {
+        try await blockAnEditOfAnUploadedRow()
+
+        let nextLaunch = try SyncEngine(
+          container: container,
+          defaultZone: SyncEngine.defaultTestZone,
+          defaultSyncEngines: { _, _ in fatalError("never started") },
+          userDatabase: userDatabase,
+          logger: Logger(.disabled),
+          delegate: nil,
+          tables: syncEngine.tables,
+          privateTables: syncEngine.privateTables
+        )
+        #expect(!nextLaunch.isRunning)
+        #expect(nextLaunch.hasChangesAwaitingICloudStorage)
       }
 
       // Only the first quota failure reports: retrying at each start against

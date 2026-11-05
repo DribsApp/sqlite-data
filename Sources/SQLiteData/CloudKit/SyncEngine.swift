@@ -329,6 +329,12 @@
         ),
         configuration: userDatabase.configuration
       )
+      // Known from the first read, not only once `start()` has re-queued the
+      // blocked saves: an observer would otherwise see false, then true, at
+      // every launch, and take it for the account filling up again.
+      quotaBlockedRecordCount.setValue(
+        (try? metadatabase.read { db in try QuotaBlockedRecordID.count().fetchOne(db) }) ?? 0
+      )
       self.tablesByName = Dictionary(
         uniqueKeysWithValues: self.tables.map { ($0.base.tableName, $0) }
       )
