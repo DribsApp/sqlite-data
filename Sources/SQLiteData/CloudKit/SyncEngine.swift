@@ -44,6 +44,9 @@
     private let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
+    // Rows in `QuotaBlockedRecordID`, mirrored here so that
+    // `hasChangesAwaitingICloudStorage` is observable.
+    private let quotaBlockedRecordCount = LockIsolated(0)
     // Server records parked by a foreign-key violation during apply (child
     // arrived before its parent — routine across fetch batches, since the
     // server delivers records in arbitrary order). The per-batch retry
@@ -533,6 +536,26 @@
       isSendingChanges || isFetchingChanges
     }
 
+    /// Whether local changes are waiting to sync because the user's iCloud
+    /// storage is full.
+    ///
+    /// True from the first save CloudKit rejects with `quotaExceeded` until
+    /// every such change has been saved, or deleted locally. The sync engine
+    /// retries them at each start and whenever a later save succeeds, so the
+    /// value clears on its own once the user frees space. It is observable, so
+    /// a view can tell the user why their changes are not syncing.
+    public var hasChangesAwaitingICloudStorage: Bool {
+      observationRegistrar.access(self, keyPath: \.hasChangesAwaitingICloudStorage)
+      return quotaBlockedRecordCount.value > 0
+    }
+
+    private func setQuotaBlockedRecordCount(_ count: Int) {
+      guard quotaBlockedRecordCount.value != count else { return }
+      observationRegistrar.withMutation(of: self, keyPath: \.hasChangesAwaitingICloudStorage) {
+        quotaBlockedRecordCount.setValue(count)
+      }
+    }
+
     /// Stops the sync engine if it is running.
     ///
     /// All edits made after stopping the sync engine will not be synchronized to CloudKit.
@@ -693,6 +716,9 @@
             // no-op when nothing is stranded, and legitimately-pending rows
             // coalesce by record ID.
             try await enqueueUnknownRecordsForCloudKit()
+            // Saves CloudKit refused for lack of iCloud storage. They may fail
+            // again, but only a retry can tell whether the user freed space.
+            try await requeueQuotaBlockedRecords()
           }
         }
       }
@@ -854,6 +880,40 @@
             .execute(db)
         }
       }
+    }
+
+    /// Re-queues the saves recorded in `QuotaBlockedRecordID`, first
+    /// forgetting rows that no longer exist locally or are being deleted.
+    ///
+    /// Touching the metadata fires the same triggers a local edit does, which
+    /// queue a save into the running engine. The rows stay in the table until
+    /// a save goes through, so a retry that fails again loses nothing.
+    private func requeueQuotaBlockedRecords() async throws {
+      let count = try await userDatabase.write { db in
+        try #sql(
+          """
+          DELETE FROM \(QuotaBlockedRecordID.self)
+          WHERE ("recordName", "zoneName", "ownerName") NOT IN (
+            SELECT "recordName", "zoneName", "ownerName" FROM \(SyncMetadata.self)
+            WHERE NOT "_isDeleted"
+          )
+          """
+        )
+        .execute(db)
+        try $_isSynchronizingChanges.withValue(false) {
+          try #sql(
+            """
+            UPDATE \(SyncMetadata.self) SET "recordPrimaryKey" = "recordPrimaryKey"
+            WHERE ("recordName", "zoneName", "ownerName") IN (
+              SELECT "recordName", "zoneName", "ownerName" FROM \(QuotaBlockedRecordID.self)
+            )
+            """
+          )
+          .execute(db)
+        }
+        return try QuotaBlockedRecordID.count().fetchOne(db) ?? 0
+      }
+      setQuotaBlockedRecordCount(count)
     }
 
     private func uploadRecordsToCloudKit<T>(
@@ -2231,6 +2291,7 @@
           default: (0, error.localizedDescription)
         ].count += 1
       }
+      var quotaBlockedSaves: [CKRecord] = []
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -2359,10 +2420,15 @@
           .accountTemporarilyUnavailable:
           continue
 
+        // The user's iCloud storage is full. Keep the save for a later retry
+        // rather than re-queueing it now, which would fail again and again.
+        case .quotaExceeded:
+          quotaBlockedSaves.append(failedRecord)
+
         case .internalError, .partialFailure, .badContainer, .missingEntitlement,
           .invalidArguments, .resultsTruncated, .assetFileNotFound,
           .assetFileModified, .incompatibleVersion, .constraintViolation, .changeTokenExpired,
-          .badDatabase, .quotaExceeded, .limitExceeded, .userDeletedZone, .tooManyParticipants,
+          .badDatabase, .limitExceeded, .userDeletedZone, .tooManyParticipants,
           .alreadyShared, .managedAccountRestricted, .participantMayNeedVerification,
           .assetNotAvailable:
           recordDroppedSave(failedRecord, error)
@@ -2387,6 +2453,12 @@
           """
         )
       }
+
+      await updateQuotaBlockedRecords(
+        blocked: quotaBlockedSaves,
+        saved: savedRecords.map(\.recordID),
+        deleted: deletedRecordIDs
+      )
 
       let enqueuedUnsyncedRecordID =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -2430,6 +2502,69 @@
         ?? false
       if enqueuedUnsyncedRecordID {
         await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
+      }
+    }
+
+    /// Records saves CloudKit refused for lack of iCloud storage, forgets the
+    /// ones whose save or delete has now gone through, and retries the rest
+    /// when this batch shows the account has space again.
+    private func updateQuotaBlockedRecords(
+      blocked: [CKRecord],
+      saved: [CKRecord.ID],
+      deleted: [CKRecord.ID]
+    ) async {
+      let sent = saved + deleted
+      guard !blocked.isEmpty || (!sent.isEmpty && quotaBlockedRecordCount.value > 0)
+      else { return }
+
+      let counts = await withErrorReporting(.sqliteDataCloudKitFailure) {
+        try await userDatabase.write { db in
+          let countBefore = try QuotaBlockedRecordID.count().fetchOne(db) ?? 0
+          if !sent.isEmpty {
+            try QuotaBlockedRecordID.findAll(sent).delete().execute(db)
+          }
+          if !blocked.isEmpty {
+            try QuotaBlockedRecordID.insert {
+              for record in blocked {
+                QuotaBlockedRecordID(recordID: record.recordID)
+              }
+            } onConflictDoUpdate: { _ in
+            }
+            .execute(db)
+          }
+          return (before: countBefore, after: try QuotaBlockedRecordID.count().fetchOne(db) ?? 0)
+        }
+      }
+      guard let counts else { return }
+      setQuotaBlockedRecordCount(counts.after)
+
+      // Report when quota starts blocking saves, not on every retry against
+      // an account that is still full: those happen at each launch. A fresh
+      // error carries the code alone, as the failed save's own error holds
+      // the client record, whose fields are user data.
+      if counts.before == 0 {
+        let countsByRecordType = Dictionary(grouping: blocked, by: \.recordType)
+          .mapValues(\.count)
+        for (recordType, count) in countsByRecordType.sorted(by: { $0.key < $1.key }) {
+          reportIssue(
+            CKError(.quotaExceeded),
+            """
+            Deferred \(count) unsent '\(recordType)' \
+            \(count == 1 ? "save" : "saves") until iCloud has space: \
+            the user's iCloud storage is full
+            """
+          )
+        }
+      }
+
+      // A save went through and none hit the quota, so the account has space
+      // again: send the rest now rather than at the next launch. Deletes say
+      // nothing, as they go through on a full account too. A batch with any
+      // quota failure never retries here, so this cannot loop.
+      if blocked.isEmpty, !saved.isEmpty, counts.after > 0 {
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await requeueQuotaBlockedRecords()
+        }
       }
     }
 

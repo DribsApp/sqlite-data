@@ -16,6 +16,9 @@
       package var storage: [CKRecordZone.ID: Zone] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
+      /// Simulates a full iCloud account: every record save fails with
+      /// `quotaExceeded`. Deletes still go through, as they free space.
+      package var isQuotaExceeded = false
       mutating func nextRecordChangeTag() -> Int {
         lastRecordChangeTag += 1
         return lastRecordChangeTag
@@ -115,6 +118,11 @@
         switch savePolicy {
         case .ifServerRecordUnchanged:
           for recordToSave in recordsToSave {
+            guard !state.isQuotaExceeded
+            else {
+              saveResults[recordToSave.recordID] = .failure(CKError(.quotaExceeded))
+              continue
+            }
             if let share = recordToSave as? CKShare {
               let isSavingRootRecord = recordsToSave.contains(where: {
                 $0.share?.recordID == share.recordID

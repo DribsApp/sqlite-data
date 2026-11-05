@@ -138,6 +138,21 @@
       )
       .execute(db)
     }
+    // Dribs fork: saves CKSyncEngine dropped after `quotaExceeded`, kept so
+    // they can be retried once the account has space again.
+    migrator.registerMigration("Create Quota Blocked Record IDs Table") { db in
+      try #sql(
+        """
+        CREATE TABLE "\(raw: .sqliteDataCloudKitSchemaName)_quotaBlockedRecordIDs" (
+          "recordName" TEXT NOT NULL,
+          "zoneName" TEXT NOT NULL,
+          "ownerName" TEXT NOT NULL,
+          PRIMARY KEY ("recordName", "zoneName", "ownerName")
+        ) STRICT
+        """
+      )
+      .execute(db)
+    }
     #if DEBUG
       try metadatabase.read { db in
         let hasSchemaChanges = try migrator.hasSchemaChanges(db)
